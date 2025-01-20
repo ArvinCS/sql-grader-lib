@@ -3,8 +3,11 @@
  */
 package sql.grader.cs.ui;
 
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -15,12 +18,53 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Scanner;
 import java.util.UUID;
 
+import org.postgresql.util.PSQLException;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-public class App {
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
+
+@Command(mixinStandardHelpOptions = true, version = "sql-grader 1.0",
+        description = "A simple SQL grader tool")
+public class App implements Runnable {
+    private final String BASE_DIR = "/var/local/lib/postgrelate";
+
+    @Option(names = "-b", description = "Id of the batch to which the query belongs")
+    int batchId = 1;
+
+    @Option(names = "-i", description = "Dataset file path")
+    String inputFilePath = "test.in";
+
+    @Option(names = "-o", description = "Output file path")
+    String outputFilePath = "test.out";
+
+    @Option(names = "-M", description = "Meta file path")
+    String metaFilePath = "_postgrelate.meta";
+
+    @Option(names = "-t", description = "Time limit for query execution in milliseconds")
+    int timeLimitInMiliseconds = 1000;
+
+    @Option(names = "-m", description = "Memory limit for query execution in kilobytes")
+    int memoryLimitInKiloBytes = 256 * 1024;
+
+    @Option(names = "--init", description = "Initialize the grading directory")
+    boolean initGradingDirectory;
+
+    @Option(names = "--cleanup", description = "Clean the grading directory")
+    boolean cleanUpGradingDirectory;
+
+    @Option(names = "--run", description = "Grading the database")
+    boolean runGrader;
+
+    @Option(names = "-q", description = "Query file path")
+    String queryFilePath;
+
     public static String createIsolatedSchemaAndUser(Connection connection) throws SQLException {
         // Generate a random schema and user name (e.g., "student_session_<UUID>")
         String uuid = UUID.randomUUID().toString().replace("-", "_");
@@ -57,7 +101,7 @@ public class App {
         }
     }
 
-    public static List<Map<String, Object>> executeQuery(String username, String password, String schemaName, String query) {
+    public static List<Map<String, Object>> executeQuery(String username, String password, String schemaName, String query, Optional<PrintWriter> metaWriter, Optional<Integer> timeLimitInSeconds) {
         List<Map<String, Object>> result = new ArrayList<>();
 
         try (Connection connection = DatabaseConnection.getConnection(username, password)) {
@@ -69,6 +113,7 @@ public class App {
 
             // Execute the student's query
             try (PreparedStatement stmt = connection.prepareStatement(query)) {
+                stmt.setQueryTimeout(timeLimitInSeconds.orElse(2));
                 boolean hasResultSet = stmt.execute();
                 if (hasResultSet) {
                     try (ResultSet rs = stmt.getResultSet()) {
@@ -84,59 +129,121 @@ public class App {
                     }
                 }
             }
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (SQLException e) {
+            if (metaWriter.isPresent()) {
+                switch (e.getSQLState()) {
+                    case "57014":
+                        metaWriter.get().println("status:TO");
+                        break;
+                    default:
+                        metaWriter.get().println("status:IE");
+                        break;
+                }
+            }
         }
         return result;
     }
     
-    public static void main(String[] args) {
-        // Read input query from a file specified in args
-        if (args.length < 1) {
-            System.out.println("Please provide the path to the query file as an argument.");
-            return;
-        }
-        String filePath = args[0];
-        
-        // Get the connection to the main database
-        try (Connection connection = DatabaseConnection.getConnection("postgres", "postgres")) {
-            // Step 1: Create a new user and schema for isolation
-            String isolationDetails = createIsolatedSchemaAndUser(connection);
-            String[] details = isolationDetails.split(":");
-            String schemaName = details[0];
-            String userName = details[1];
-
-            
-            // Step 2: Read input query from the user
-            Scanner scanner = new Scanner(System.in);
-            StringBuilder queryBuilder = new StringBuilder();
-            String line;
-            while (scanner.hasNextLine()) {
-                line = scanner.nextLine();
-                queryBuilder.append(line).append(" ");
-            }
-            scanner.close();
-            
-            // Step 3: Execute the test case using the isolated user and schema
-            String testCase = queryBuilder.toString().trim();
-            List<Map<String, Object>> results = executeQuery("postgres", "postgres", schemaName, testCase);
-
-            // Step 4: Execute the query using the isolated user and schema
-            String solution = new String(Files.readAllBytes(Paths.get(filePath)), StandardCharsets.UTF_8).trim();
-            results.addAll(executeQuery(userName, "password", schemaName, solution));
-
-            // Step 5: Drop the schema and user after execution
-            dropSchemaAndUser(connection, schemaName, userName);
-
-            ObjectMapper objectMapper = new ObjectMapper();
+    @Override
+    public void run() {
+        Path dirBatch = Paths.get(BASE_DIR + "/batch_" + batchId);
+        if (initGradingDirectory) {
             try {
-                String jsonResult = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(results);
-                System.out.println(jsonResult);
+                Files.createDirectories(dirBatch);
+                System.out.println(dirBatch.toString());
             } catch (Exception e) {
-                e.printStackTrace();
+                System.exit(1);
             }
-        } catch (Exception e) {
-            e.printStackTrace();
         }
+
+        if (runGrader) {
+            if (queryFilePath == null) {
+                System.exit(1);
+            }
+            try (Scanner scanner = new Scanner(Paths.get(inputFilePath), StandardCharsets.UTF_8);
+                PrintWriter outputWriter = new PrintWriter(Files.newBufferedWriter(Paths.get(outputFilePath), StandardCharsets.UTF_8));
+                PrintWriter metaWriter = new PrintWriter(Files.newBufferedWriter(Paths.get(metaFilePath), StandardCharsets.UTF_8));
+                Connection connection = DatabaseConnection.getConnection("postgres", "postgres")) {
+                    
+                // Step 1: Create a new user and schema for isolation
+                String isolationDetails = createIsolatedSchemaAndUser(connection);
+                String[] details = isolationDetails.split(":");
+                String schemaName = details[0];
+                String userName = details[1];
+                
+                // Step 2: Read input query from the user
+                StringBuilder queryBuilder = new StringBuilder();
+                String line;
+                while (scanner.hasNextLine()) {
+                    line = scanner.nextLine();
+                    queryBuilder.append(line).append(" ");
+                }
+                scanner.close();
+                
+                // Step 3: Execute the test case using the isolated user and schema
+                String testCase = queryBuilder.toString().trim();
+                List<Map<String, Object>> results = executeQuery("postgres", "postgres", schemaName, testCase, Optional.empty(), Optional.empty());
+
+                // Step 4: Execute the query using the isolated user and schema
+                // Track memory usage
+                Runtime runtime = Runtime.getRuntime();
+                long beforeMemory = runtime.totalMemory() - runtime.freeMemory();
+
+                // Track execution time
+                long startTime = System.nanoTime();
+
+                String solution = new String(Files.readAllBytes(Paths.get(queryFilePath)), StandardCharsets.UTF_8).trim();
+                results.addAll(executeQuery(userName, "password", schemaName, solution, Optional.of(metaWriter), Optional.of((int) Math.ceil(timeLimitInMiliseconds / 1000.0))));
+                
+                long endTime = System.nanoTime();
+                long afterMemory = runtime.totalMemory() - runtime.freeMemory();
+
+                // Calculate query time and memory usage
+                long durationInMillis = (endTime - startTime) / 1_000_000; // Convert to milliseconds
+                long memoryUsed = (afterMemory - beforeMemory) / 1024;
+                
+                // revalidation
+                if (durationInMillis > timeLimitInMiliseconds) {
+                    metaWriter.println("status:TO");
+                }
+
+                metaWriter.println("time:" + durationInMillis);
+                metaWriter.println("time-wall:" + durationInMillis);
+                metaWriter.println("cg-mem:" + memoryUsed);
+
+                // Step 5: Drop the schema and user after execution
+                dropSchemaAndUser(connection, schemaName, userName);
+
+                ObjectMapper objectMapper = new ObjectMapper();
+                String jsonResult = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(results);
+                outputWriter.println(jsonResult);
+                outputWriter.close();    
+            } catch (Exception e) {
+                throw new RuntimeException(e.getMessage());
+            }
+        }
+        
+        if (cleanUpGradingDirectory) {
+            try {
+                if (Files.exists(dirBatch)) {
+                    Files.walk(dirBatch)
+                        .sorted((path1, path2) -> path2.compareTo(path1)) // Sort in reverse order to delete files before directories
+                        .forEach(path -> {
+                            try {
+                                Files.delete(path);
+                            } catch (IOException e) {
+                                System.exit(1);
+                            }
+                        });
+                }
+            } catch (Exception e) {
+                System.exit(1);
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        int exitCode = new CommandLine(new App()).execute(args);
+        System.exit(exitCode);
     }
 }
